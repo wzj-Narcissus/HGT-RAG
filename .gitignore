@@ -149,7 +149,6 @@ dmypy.json
 .idea/
 
 # DATA
-data/
 
 # for MacOS
 *.DS_Store
