@@ -1,0 +1,68 @@
+# Config for 4096-dim embedding-only ablation (no projection)
+data:
+  dataset_dir: "dataset"
+  image_dir: "dataset/images/final_dataset_images"
+  train_file: "MMQA_train.jsonl.gz"
+  dev_file: "MMQA_dev.jsonl.gz"
+  test_file: "MMQA_test.jsonl.gz"
+  texts_file: "MMQA_texts.jsonl.gz"
+  tables_file: "MMQA_tables.jsonl.gz"
+  images_file: "MMQA_images.jsonl.gz"
+  max_train_samples: null
+  max_dev_samples: null
+
+encoder:
+  name: "qwen3_vl_embedding_8b"
+  model_name_or_path: "/model/ModelScope/Qwen/Qwen3-VL-Embedding-8B"
+  fallback: "sentence_transformers"
+  fallback_text_model: "sentence-transformers/all-MiniLM-L6-v2"
+  hidden_dim: 4096
+  projection_dim: null           # 4096-dim, no projection
+  fallback_hidden_dim: 384
+  batch_size: 32
+  image_batch_size: 8
+  max_text_length: 512
+  dtype: "bf16"
+  device: "cuda"
+
+graph:
+  candidate_mode: "oracle"
+  max_cells_per_table: 200
+  text_refers_table_threshold: 0
+  text_refers_image_threshold: 0
+
+model:
+  hidden_dim: 256
+  num_heads: 4
+  num_layers: 3
+  dropout: 0.1
+  scoring_head: "query_aware"
+
+training:
+  epochs: 0                       # skip training, data only
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+  use_amp: true
+  prefetch_factor: 2
+  lr: 0.0001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  seed: 42
+  lambda_text: 1.0
+  lambda_cell: 1.0
+  lambda_image: 1.0
+  lambda_caption: 0.5
+  lambda_rank: 0.5
+  margin: 1.0
+  focal_gamma: 2.0
+  focal_alpha: null
+  chunk_size: 2000
+
+output:
+  graphs_dir: "outputs/graphs"
+  features_dir: "outputs/features"
+  hetero_dir: "outputs/hetero_4096"
+  checkpoints_dir: "outputs/checkpoints_4096"
+  predictions_dir: "outputs/predictions"
+  save_every: 1

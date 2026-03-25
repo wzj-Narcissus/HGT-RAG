@@ -125,6 +125,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+myenv/
 
 # Spyder project settings
 .spyderproject
@@ -152,3 +153,10 @@ data/
 
 # for MacOS
 *.DS_Store
+outputs/
+
+
+dataset/images/
+final_dataset_images.zip
+
+docs/

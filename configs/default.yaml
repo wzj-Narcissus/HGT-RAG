@@ -1,0 +1,70 @@
+# HGT pipeline default configuration
+
+data:
+  dataset_dir: "dataset"
+  image_dir: "dataset/images/final_dataset_images"
+  train_file: "MMQA_train.jsonl.gz"
+  dev_file: "MMQA_dev.jsonl.gz"
+  test_file: "MMQA_test.jsonl.gz"
+  texts_file: "MMQA_texts.jsonl.gz"
+  tables_file: "MMQA_tables.jsonl.gz"
+  images_file: "MMQA_images.jsonl.gz"
+  max_train_samples: null   # null = all, set integer for debug
+  max_dev_samples: null
+
+encoder:
+  name: "qwen3_vl_embedding_8b"          # primary encoder
+  model_name_or_path: "/model/ModelScope/Qwen/Qwen3-VL-Embedding-8B"
+  fallback: "sentence_transformers"       # used if qwen unavailable
+  fallback_text_model: "sentence-transformers/all-MiniLM-L6-v2"
+  hidden_dim: 4096                        # Qwen3-VL-Embedding-8B text_config.hidden_size
+  projection_dim: 256                     # project embeddings to this dim before saving cache
+  fallback_hidden_dim: 384               # MiniLM output dim
+  batch_size: 32                          # RTX40 24GB显存，text编码批大小
+  image_batch_size: 8                     # 图像编码批大小（token更多，适当小）
+  max_text_length: 512
+  dtype: "bf16"                           # fp32 / fp16 / bf16
+  device: "cuda"                          # cuda / cpu
+
+graph:
+  candidate_mode: "oracle"               # oracle | retrieval_lite
+  max_cells_per_table: 200              # cap cells for very large tables
+  text_refers_table_threshold: 0      # add edge only if cosine sim >= threshold
+  text_refers_image_threshold: 0      # add edge only if cosine sim >= threshold
+
+model:
+  hidden_dim: 256
+  num_heads: 4
+  num_layers: 3
+  dropout: 0.1
+  scoring_head: "query_aware"            # query_aware | mlp | bilinear
+
+training:
+  epochs: 10
+  batch_size: 16                         # graphs per batch (increased for better GPU utilization)
+  num_workers: 4                         # DataLoader workers for parallel data loading
+  pin_memory: true                       # pin memory for faster CPU->GPU transfer
+  use_amp: true                          # use automatic mixed precision training
+  prefetch_factor: 2                     # batches to prefetch per worker
+  lr: 0.0001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  seed: 42
+  lambda_text: 1.0
+  lambda_cell: 1.0
+  lambda_image: 1.0
+  lambda_caption: 0.5
+  lambda_rank: 0.5
+  margin: 1.0                            # ranking loss margin
+  focal_gamma: 2.0                       # Focal Loss gamma, 0 = standard BCE
+  focal_alpha: null                      # Focal Loss alpha: float, dict per type, or null
+                                         # Example per-type: {textblock: 0.6, cell: 0.9, image: 0.7, caption: 0.7, table: 0.5}
+  chunk_size: 2000                       # null = process all at once, integer = chunk size
+
+output:
+  graphs_dir: "outputs/graphs"
+  features_dir: "outputs/features"
+  hetero_dir: "outputs/hetero"
+  checkpoints_dir: "outputs/checkpoints"
+  predictions_dir: "outputs/predictions"
+  save_every: 1
