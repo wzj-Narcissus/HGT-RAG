@@ -41,6 +41,7 @@ class Trainer:
         self._best_metric_name: Optional[str] = None
         self._best_metric_value: Optional[float] = None
         self._best_metrics: Dict[str, float] = {}
+        self._best_thresholds: Dict[str, float] = {}
 
         # Automatic Mixed Precision (AMP) support
         self.scaler = GradScaler('cuda') if train_cfg.get("use_amp", False) and device == "cuda" else None
@@ -62,6 +63,7 @@ class Trainer:
             Average loss for the epoch
         """
         self.model.train()
+        self.loss_fn.train()
         total_loss = 0.0
         n_pos_total = {ntype: 0 for ntype in ["textblock", "cell", "image", "caption", "table"]}
         n_neg_total = {ntype: 0 for ntype in ["textblock", "cell", "image", "caption", "table"]}
@@ -124,11 +126,18 @@ class Trainer:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def evaluate(self, dataloader: Union[DataLoader, List[HeteroData], None]) -> Dict[str, float]:
+    def evaluate(
+        self,
+        dataloader: Union[DataLoader, List[HeteroData], None],
+        thresholds: Optional[Dict[str, float]] = None,
+        freeze_thresholds: bool = False,
+    ) -> Dict[str, float]:
         """Evaluate on validation set.
 
         Args:
             dataloader: DataLoader, list of HeteroData objects, or None
+            thresholds: Optional externally supplied per-type thresholds
+            freeze_thresholds: If True, reuse supplied thresholds instead of optimizing on this split
 
         Returns:
             Dictionary of evaluation metrics
@@ -137,21 +146,43 @@ class Trainer:
             return {}
 
         self.model.eval()
+        self.loss_fn.eval()
+        if thresholds is not None:
+            self.metrics.set_thresholds(thresholds, freeze=freeze_thresholds)
+        elif freeze_thresholds:
+            self.metrics.set_thresholds(self._best_thresholds, freeze=True)
+        else:
+            self.metrics.set_thresholds(None, freeze=False)
         self.metrics.reset()
         total_loss = 0.0
+        cudnn_benchmark = None
+        cudnn_deterministic = None
+        if self.device == "cuda":
+            cudnn_benchmark = torch.backends.cudnn.benchmark
+            cudnn_deterministic = torch.backends.cudnn.deterministic
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
 
-        for data in dataloader:
-            data = data.to(self.device, non_blocking=True)
-            logits = self.model(data)
-            loss_dict = self.loss_fn(logits, data)
-            total_loss += loss_dict["total"].item()
-            self.metrics.update(logits, data)
+        try:
+            for data in dataloader:
+                data = data.to(self.device, non_blocking=True)
+                logits = self.model(data)
+                loss_dict = self.loss_fn(logits, data)
+                total_loss += loss_dict["total"].item()
+                self.metrics.update(logits, data)
+        finally:
+            if cudnn_benchmark is not None:
+                torch.backends.cudnn.benchmark = cudnn_benchmark
+                torch.backends.cudnn.deterministic = cudnn_deterministic
 
         result = self.metrics.compute()
+        result["thresholds"] = self.metrics.get_thresholds()
         num_batches = len(dataloader) if hasattr(dataloader, "__len__") else 1
         result["loss"] = total_loss / max(num_batches, 1)
 
-        logger.info("[Eval] " + " | ".join(f"{k}={v:.4f}" for k, v in result.items()))
+        # Log only numeric metrics (exclude nested dicts like thresholds)
+        log_items = [f"{k}={v:.4f}" for k, v in result.items() if isinstance(v, (int, float))]
+        logger.info("[Eval] " + " | ".join(log_items))
         return result
 
     # ------------------------------------------------------------------
@@ -212,6 +243,7 @@ class Trainer:
                 "best_metric_name": self._best_metric_name,
                 "best_metric_value": self._best_metric_value,
                 "best_metrics": self._best_metrics,
+                "best_thresholds": self._best_thresholds,
             },
             path,
         )
@@ -234,11 +266,16 @@ class Trainer:
         # Restore best-checkpoint selection state
         best_metrics = ckpt.get("best_metrics", {})
         self._best_metrics = best_metrics if isinstance(best_metrics, dict) else {}
+        best_thresholds = ckpt.get("best_thresholds", {})
+        self._best_thresholds = best_thresholds if isinstance(best_thresholds, dict) else {}
         # Legacy: best.pt may store metrics in "metrics" field
         if not self._best_metrics and ckpt.get("epoch") == -1:
             metrics = ckpt.get("metrics", {})
             if isinstance(metrics, dict):
                 self._best_metrics = metrics
+                thresholds = metrics.get("thresholds", {})
+                if isinstance(thresholds, dict):
+                    self._best_thresholds = thresholds
 
         # Select best metric from available metrics
         selected_metric = self._select_checkpoint_metric(self._best_metrics)
@@ -397,6 +434,7 @@ class Trainer:
                     self._best_metric_name = best_metric_name
                     self._best_metric_value = best_metric_value
                     self._best_metrics = dict(metrics)
+                    self._best_thresholds = dict(metrics.get("thresholds", {}))
                     self.save_checkpoint(-1, metrics, resume_epoch=epoch)  # best model
                     best_path = os.path.join(
                         self.output_cfg.get("checkpoints_dir", "outputs/checkpoints"),

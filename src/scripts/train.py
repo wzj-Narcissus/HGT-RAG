@@ -19,6 +19,7 @@ import yaml
 from torch_geometric.loader import DataLoader
 
 from src.data.qwen_vl_encoder import QwenVLFeatureEncoder
+from src.data.feature_builder import _table_to_image
 from src.data.hetero_converter import convert_to_heterodata
 from src.models.hgt_model import HGTEvidenceModel
 from src.trainers.losses import EvidenceSelectionLoss
@@ -28,7 +29,7 @@ from src.utils.seed import set_seed
 
 logger = get_logger(__name__)
 
-GRAPH_EDGE_SCHEMA_VERSION = "v3_original_query_to_cell_heuristic_refs"
+GRAPH_EDGE_SCHEMA_VERSION = "v5_table_image_with_cell_bidirectional"
 
 
 # ---------------------------------------------------------------------------
@@ -80,13 +81,14 @@ def load_graphs_parallel(graphs_dir: str, split: str, n_workers: int = 16):
 # ---------------------------------------------------------------------------
 
 def _collect_unique_nodes(graphs, image_dir):
-    """Collect all unique text nodes and image nodes across all graphs."""
-    text_nodes = {}   # node_id -> text  (query/textblock/table/cell/caption)
+    """Collect all unique text nodes and image-like nodes across all graphs."""
+    text_nodes = {}   # node_id -> text  (query/textblock/cell/caption)
     image_nodes = {}  # node_id -> (path, title)
+    table_nodes = {}  # node_id -> (table_data, title)
 
     for graph in graphs:
         nodes = graph.get("nodes", {})
-        for ntype in ["query", "textblock", "table", "cell", "caption"]:
+        for ntype in ["query", "textblock", "cell", "caption"]:
             for n in nodes.get(ntype, []):
                 nid = n["node_id"]
                 if nid not in text_nodes:
@@ -99,7 +101,12 @@ def _collect_unique_nodes(graphs, image_dir):
                 full_path = os.path.join(image_dir, raw_path) if image_dir and raw_path else raw_path
                 image_nodes[nid] = (full_path, n.get("title", "") or "")
 
-    return text_nodes, image_nodes
+        for n in nodes.get("table", []):
+            nid = n["node_id"]
+            if nid not in table_nodes:
+                table_nodes[nid] = (n.get("table_data", {}), n.get("title", "") or "")
+
+    return text_nodes, image_nodes, table_nodes
 
 
 def _feature_dim_from_cache(cache) -> Optional[int]:
@@ -159,13 +166,12 @@ def build_or_load_feature_cache(
 
     save_every = 1000  # save checkpoint every N batches
 
-    text_nodes, image_nodes = _collect_unique_nodes(graphs, image_dir)
+    text_nodes, image_nodes, table_nodes = _collect_unique_nodes(graphs, image_dir)
     logger.info(
-        f"[Phase2] Unique nodes: {len(text_nodes)} text, {len(image_nodes)} image"
+        f"[Phase2] Unique nodes: {len(text_nodes)} text, {len(image_nodes)} image, {len(table_nodes)} table"
     )
 
     cache = None
-    cache_is_projected = use_projection
     if os.path.exists(cache_path):
         cache = _load_cache_if_compatible(cache_path, expected_cache_dim, "Feature cache")
         if cache is not None:
@@ -178,11 +184,9 @@ def build_or_load_feature_cache(
             os.remove(ckpt_path)
             logger.info(f"[Phase2] Removed stale checkpoint: {ckpt_path}")
         else:
-            cache_is_projected = use_projection
             logger.info("[Phase2] Resuming from feature cache checkpoint and filling missing nodes only.")
     if cache is None:
         cache = {}
-        cache_is_projected = False
 
     proj_matrix = _build_projection_matrix() if use_projection else None
 
@@ -261,14 +265,55 @@ def build_or_load_feature_cache(
 
     logger.info(f"[Phase2] Image encoding done in {time.time()-t2:.1f}s")
 
-    # ---- Optional random projection to reduce dimensionality ---------------
-    if use_projection and not cache_is_projected:
-        logger.info(f"[Phase2] Applying random projection {encoder.hidden_dim}→{projection_dim} ...")
-        cache = {
-            nid: torch.nn.functional.normalize(emb @ proj_matrix, dim=-1)
-            for nid, emb in cache.items()
-        }
-        logger.info(f"[Phase2] Projection done. cache dim={projection_dim}")
+    # ---- Encode table nodes (render to image then encode) ------------------
+    table_nids = [nid for nid in table_nodes.keys() if nid not in cache]
+    logger.info(f"[Phase2] Encoding {len(table_nids)} table nodes as images (batch={image_batch_size}, {len(table_nodes)-len(table_nids)} already cached)...")
+    t3 = time.time()
+    temp_table_files = []
+    try:
+        table_image_paths = []
+        table_ids_for_paths = []
+        table_fallback_ids = []
+        table_fallback_titles = []
+        for nid in table_nids:
+            table_data, title = table_nodes[nid]
+            img_path = _table_to_image(table_data, title, max_rows=None)
+            if img_path:
+                table_image_paths.append(img_path)
+                table_ids_for_paths.append(nid)
+                temp_table_files.append(img_path)
+            else:
+                table_fallback_ids.append(nid)
+                table_fallback_titles.append(title if title else "[table]")
+        if table_image_paths:
+            for i in range(0, len(table_image_paths), image_batch_size):
+                batch_ids = table_ids_for_paths[i: i + image_batch_size]
+                batch_paths = table_image_paths[i: i + image_batch_size]
+                embs = encoder.encode_images(batch_paths)
+                if use_projection:
+                    embs = torch.nn.functional.normalize(embs @ proj_matrix, dim=-1)
+                for nid, emb in zip(batch_ids, embs):
+                    cache[nid] = emb
+                if (i // image_batch_size + 1) % save_every == 0:
+                    torch.save(cache, ckpt_path)
+        if table_fallback_ids:
+            for i in range(0, len(table_fallback_ids), text_batch_size):
+                batch_ids = table_fallback_ids[i: i + text_batch_size]
+                batch_texts = table_fallback_titles[i: i + text_batch_size]
+                embs = encoder.encode_texts(batch_texts)
+                if use_projection:
+                    embs = torch.nn.functional.normalize(embs @ proj_matrix, dim=-1)
+                for nid, emb in zip(batch_ids, embs):
+                    cache[nid] = emb
+                if (i // text_batch_size + 1) % save_every == 0:
+                    torch.save(cache, ckpt_path)
+    finally:
+        for p in temp_table_files:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    logger.info(f"[Phase2] Table encoding done in {time.time()-t3:.1f}s")
 
     # ---- Save cache to disk (and clean up checkpoint) ----------------------
     if os.path.dirname(cache_path):
@@ -636,6 +681,7 @@ def main():
         lambda_cell=train_cfg.get("lambda_cell", 1.0),
         lambda_image=train_cfg.get("lambda_image", 1.0),
         lambda_caption=train_cfg.get("lambda_caption", 0.5),
+        lambda_table=train_cfg.get("lambda_table", 0.5),
         lambda_rank=train_cfg.get("lambda_rank", 0.5),
         margin=train_cfg.get("margin", 1.0),
         focal_gamma=train_cfg.get("focal_gamma", 2.0),

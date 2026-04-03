@@ -27,8 +27,8 @@ encoder:
   device: "cuda"                          # cuda / cpu
 
 graph:
-  candidate_mode: "oracle"               # oracle | retrieval_lite
-  max_cells_per_table: 200              # cap cells for very large tables
+  candidate_mode: "oracle"               # oracle (retrieval_lite not yet supported)
+  max_cells_per_table: 200              # cap non-positive cell nodes per table; gold positive cells are always kept
   text_refers_table_threshold: 0      # add edge only if cosine sim >= threshold
   text_refers_image_threshold: 0      # add edge only if cosine sim >= threshold
 
@@ -54,6 +54,7 @@ training:
   lambda_cell: 1.0
   lambda_image: 1.0
   lambda_caption: 0.5
+  lambda_table: 0.5
   lambda_rank: 0.5
   margin: 1.0                            # ranking loss margin
   focal_gamma: 2.0                       # Focal Loss gamma, 0 = standard BCE

@@ -142,10 +142,10 @@ class EvidenceSelectionLoss(nn.Module):
     ) -> Optional[torch.Tensor]:
         """Margin ranking loss: score(pos) - score(neg) > margin.
 
-        Only applied to primary evidence types (textblock, cell, image).
+        Applied to primary evidence types (textblock, cell, image, table).
         """
         all_pos = []
-        for ntype in ["textblock", "cell", "image"]:
+        for ntype in ["textblock", "cell", "image", "table"]:
             if ntype not in logits or logits[ntype].shape[0] == 0:
                 continue
             if not hasattr(data[ntype], "y") or data[ntype].y is None:
@@ -156,8 +156,10 @@ class EvidenceSelectionLoss(nn.Module):
             neg_mask = ~pos_mask
             if pos_mask.sum() == 0 or neg_mask.sum() == 0:
                 continue
+
             pos_scores = logit[pos_mask]
             neg_scores = logit[neg_mask]
+
             # Broadcast: all positive vs all negative pairs
             p = pos_scores.unsqueeze(1)   # (P, 1)
             n = neg_scores.unsqueeze(0)   # (1, N)

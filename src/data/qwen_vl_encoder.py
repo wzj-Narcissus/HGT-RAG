@@ -244,7 +244,33 @@ class _RandomEncoder(BaseEncoder):
 # ---------------------------------------------------------------------------
 
 class QwenVLFeatureEncoder:
-    """Public API. Auto-selects Qwen or fallback based on environment."""
+    """Unified encoder facade that auto-selects the best available backend.
+
+    Instantiation is via :meth:`from_config`, not the constructor directly.
+
+    Backend priority
+    ----------------
+    1. **Qwen3-VL-Embedding-8B** — multimodal embeddings using the official
+       processor and chat-template API.  Requires a CUDA-capable GPU (~16 GB
+       VRAM in bf16) and the model weights at ``model_path`` in the config.
+    2. **SentenceTransformers** (``all-MiniLM-L6-v2`` by default) — text-only
+       fallback when the Qwen model cannot be loaded.  Image paths are encoded
+       as zero vectors; ``feature_builder.py`` substitutes the image title text
+       in that case.
+    3. **RandomEncoder** — last-resort CPU-only stub that returns normalised
+       random vectors.  Useful for unit tests and CI without GPU access;
+       outputs have no semantic meaning.
+
+    Config keys (``encoder:`` section of the YAML)
+    -----------------------------------------------
+    ``name``               : ``"qwen3_vl_embedding_8b"`` (default)
+    ``model_path``         : path/to/Qwen3-VL-Embedding-8B weights
+    ``device``             : ``"cuda"`` (default) or ``"cpu"``
+    ``dtype``              : ``"bf16"`` | ``"fp16"`` | ``"fp32"``
+    ``batch_size``         : forward-pass batch size (default 8)
+    ``max_text_length``    : tokeniser max length (default 512)
+    ``fallback_text_model``: SentenceTransformers model ID for fallback
+    """
 
     def __init__(self, encoder: BaseEncoder):
         self._enc = encoder
@@ -254,9 +280,29 @@ class QwenVLFeatureEncoder:
         return self._enc.hidden_dim
 
     def encode_texts(self, texts: List[str]) -> torch.Tensor:
+        """Encode a list of strings into L2-normalised embeddings.
+
+        Args:
+            texts: List of input strings (may be empty).
+
+        Returns:
+            Float32 CPU tensor of shape ``(len(texts), hidden_dim)``.
+        """
         return self._enc.encode_texts(texts)
 
     def encode_images(self, image_paths: List[str]) -> torch.Tensor:
+        """Encode a list of image file paths into L2-normalised embeddings.
+
+        When using the SentenceTransformer or Random fallback backend, returns
+        zero vectors (the caller in ``feature_builder.py`` falls back to the
+        image title text in that case).
+
+        Args:
+            image_paths: List of absolute or relative paths to image files.
+
+        Returns:
+            Float32 CPU tensor of shape ``(len(image_paths), hidden_dim)``.
+        """
         return self._enc.encode_images(image_paths)
 
     def encode_text_image_pairs(

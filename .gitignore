@@ -159,3 +159,12 @@ dataset/images/
 final_dataset_images.zip
 
 docs/
+
+# MMDocIR evaluation dataset (large binary files, downloaded via download_data.py)
+mmdocir_data/
+
+# Experimental config variants
+configs/exp_*.yaml
+
+# Development notes (local only)
+work.md

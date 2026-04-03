@@ -1,0 +1,31 @@
+# Stage 2 HGT Reranker Configuration for MMDocIR
+
+data:
+  pages_parquet:     mmdocir_data/MMDocIR_pages.parquet
+  layouts_parquet:   mmdocir_data/MMDocIR_layouts.parquet
+  annotations_jsonl: mmdocir_data/MMDocIR_annotations.jsonl
+  text_mode:         ocr_text          # "ocr_text" or "vlm_text"
+  top_k_pages:       10                # Stage 1 top-K (1 / 5 / 10)
+  max_layouts_per_page: null           # null = no cap
+
+model:
+  in_dim:      4096   # Qwen3-VL-Embedding-8B output dim
+  hidden_dim:  256    # HGT hidden dimension
+  num_heads:   4
+  num_layers:  3      # 3-layer HGT as designed
+  dropout:     0.1
+
+train:
+  lr:           1.0e-4
+  weight_decay: 1.0e-5
+  epochs:       10
+  log_every:    50
+  eval_every:   500
+  save_dir:     outputs/stage2_checkpoints
+
+encoder:
+  model_path:   /model/ModelScope/Qwen/Qwen3-VL-Embedding-8B
+  device:       cuda
+  dtype:        bf16
+  batch_size:   8
+  max_text_length: 512

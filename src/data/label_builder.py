@@ -37,7 +37,7 @@ def build_labels(question: Dict, graph: Dict) -> Dict[str, Dict[str, int]]:
     answer_text_ids: Set[str] = set()
     answer_table_ids: Set[str] = set()
     answer_image_ids: Set[str] = set()
-    positive_cells: Set[tuple] = set()  # (table_id, row, col)
+    positive_cells: Set[tuple] = set()  # (row, col)
 
     for ans in answers:
         # text_instances: list of {doc_id, ...}
@@ -82,18 +82,6 @@ def build_labels(question: Dict, graph: Dict) -> Dict[str, Dict[str, int]]:
         labels[node_id] = label
         breakdown["table"][node_id] = label
 
-    # Cell labels
-    # Need table_id from question metadata
-    meta = question.get("metadata", {})
-    q_table_id = meta.get("table_id", "")
-    for n in nodes.get("cell", []):
-        node_id = n["node_id"]
-        row = n.get("row", -1)
-        col = n.get("col", -1)
-        label = 1 if (row, col) in positive_cells else 0
-        labels[node_id] = label
-        breakdown["cell"][node_id] = label
-
     # Image labels
     for n in nodes.get("image", []):
         node_id = n["node_id"]
@@ -110,6 +98,16 @@ def build_labels(question: Dict, graph: Dict) -> Dict[str, Dict[str, int]]:
         label = labels.get(img_node_id, 0)
         labels[node_id] = label
         breakdown["caption"][node_id] = label
+
+    # Cell labels: positive if (row, col) is in positive_cells for its table
+    for n in nodes.get("cell", []):
+        node_id = n["node_id"]
+        table_id_for_cell = n.get("table_id", "")
+        row = n.get("row", -1)
+        col = n.get("col", -1)
+        label = 1 if (row, col) in positive_cells else 0
+        labels[node_id] = label
+        breakdown["cell"][node_id] = label
 
     # log stats
     for ntype, lmap in breakdown.items():

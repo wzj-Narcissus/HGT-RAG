@@ -9,10 +9,11 @@ Overall metrics are macro-averaged over the fixed scored node types
 instead of ranking nodes across different scoring heads. Missing types
 contribute 0.0 so the denominator stays consistent across evaluations.
 
-Per-type thresholds are dynamically optimized on the validation set
-to maximize F1, replacing the previous hardcoded 0.5 threshold.
+Per-type thresholds can be optimized on the validation set and then
+reused for held-out evaluation, replacing the previous hardcoded 0.5
+threshold while avoiding threshold leakage on the reported split.
 """
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import torch
 
 from src.utils.logging import get_logger
@@ -67,12 +68,14 @@ class EvidenceMetrics:
 
     Overall metrics are macro-averaged over all scored node types.
 
-    Per-type thresholds are dynamically optimized to maximize F1
-    by scanning thresholds from 0.05 to 0.95 in steps of 0.05.
+    Per-type thresholds can be optimized to maximize F1 on validation
+    data by scanning thresholds from 0.05 to 0.95 in steps of 0.05,
+    then reused unchanged for held-out evaluation.
     """
 
     def __init__(self, threshold: float = 0.5):
         self.default_threshold = threshold
+        self._frozen_thresholds = False
         self._reset()
 
     def _reset(self):
@@ -84,6 +87,7 @@ class EvidenceMetrics:
         self.per_type_thresholds: Dict[str, float] = {
             t: self.default_threshold for t in SCORED_TYPES
         }
+        self._frozen_thresholds = False
 
     def update(
         self,
@@ -99,6 +103,19 @@ class EvidenceMetrics:
             scores = torch.sigmoid(logits[ntype]).detach().cpu().tolist()
             labels = data[ntype].y.cpu().int().tolist()
             self._per_type[ntype].append((scores, labels))
+
+    def set_thresholds(self, thresholds: Optional[Dict[str, float]] = None, freeze: bool = True):
+        """Set external per-type thresholds, optionally freezing them for evaluation."""
+        merged = {t: self.default_threshold for t in SCORED_TYPES}
+        if thresholds:
+            for ntype, value in thresholds.items():
+                if ntype in merged:
+                    merged[ntype] = float(value)
+        self.per_type_thresholds = merged
+        self._frozen_thresholds = freeze
+
+    def get_thresholds(self) -> Dict[str, float]:
+        return dict(self.per_type_thresholds)
 
     def find_optimal_thresholds(self) -> Dict[str, float]:
         """Search for per-type thresholds that maximize F1 on accumulated data.
@@ -149,10 +166,13 @@ class EvidenceMetrics:
         result = {}
         per_type_metrics = {}
 
-        # Find optimal per-type thresholds before computing metrics
-        self.find_optimal_thresholds()
-        threshold_str = ", ".join(f"{t}={v:.2f}" for t, v in self.per_type_thresholds.items())
-        logger.info(f"[Metrics] Optimal per-type thresholds: {threshold_str}")
+        if not self._frozen_thresholds:
+            self.find_optimal_thresholds()
+            threshold_str = ", ".join(f"{t}={v:.2f}" for t, v in self.per_type_thresholds.items())
+            logger.info(f"[Metrics] Optimized per-type thresholds on current split: {threshold_str}")
+        else:
+            threshold_str = ", ".join(f"{t}={v:.2f}" for t, v in self.per_type_thresholds.items())
+            logger.info(f"[Metrics] Using frozen per-type thresholds: {threshold_str}")
 
         # Compute per-type metrics
         for ntype, examples in self._per_type.items():
@@ -202,4 +222,8 @@ class EvidenceMetrics:
         return result
 
     def reset(self):
+        thresholds = self.get_thresholds() if self._frozen_thresholds else None
+        freeze = self._frozen_thresholds
         self._reset()
+        if thresholds is not None:
+            self.set_thresholds(thresholds, freeze=freeze)

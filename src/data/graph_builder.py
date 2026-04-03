@@ -34,9 +34,6 @@ def _text_id(doc_id: str) -> str:
 def _table_id(table_id: str) -> str:
     return f"table::{table_id}"
 
-def _cell_id(table_id: str, row: int, col: int) -> str:
-    return f"cell::{table_id}::{row}::{col}"
-
 def _image_id(image_id: str) -> str:
     return f"image::{image_id}"
 
@@ -44,56 +41,9 @@ def _caption_id(image_id: str) -> str:
     return f"caption::{image_id}"
 
 
-# ---------------------------------------------------------------------------
-# Table flattening helpers
-# ---------------------------------------------------------------------------
+def _cell_id(table_id: str, row: int, col: int) -> str:
+    return f"cell::{table_id}::{row}::{col}"
 
-def _get_table_rows(table_record: Dict) -> List[List[Dict]]:
-    """Extract table_rows safely."""
-    table_data = table_record.get("table", {})
-    if isinstance(table_data, dict):
-        rows = table_data.get("table_rows", [])
-        return rows if isinstance(rows, list) else []
-    return []
-
-
-def _flatten_table_text(table_record: Dict, max_rows: int = 10) -> str:
-    title = table_record.get("title", "")
-    rows = _get_table_rows(table_record)
-    if not rows:
-        return title
-    header = " | ".join(c.get("text", "") for c in rows[0])
-    body_rows = []
-    for row in rows[1:max_rows + 1]:
-        body_rows.append(" ; ".join(c.get("text", "") for c in row))
-    body = " [ROW] ".join(body_rows)
-    return f"{title} [SEP] {header} [SEP] {body}"
-
-
-def _cell_text_with_context(table_record: Dict, row_idx: int, col_idx: int) -> str:
-    rows = _get_table_rows(table_record)
-    if not rows:
-        return ""
-    # header (row 0)
-    if len(rows) > 0 and col_idx < len(rows[0]):
-        header_text = rows[0][col_idx].get("text", "")
-    else:
-        header_text = ""
-    # row context: all cells in that row
-    if row_idx < len(rows):
-        row_context = " ; ".join(c.get("text", "") for c in rows[row_idx])
-    else:
-        row_context = ""
-    # cell itself
-    cell_text = ""
-    if row_idx < len(rows) and col_idx < len(rows[row_idx]):
-        cell_text = rows[row_idx][col_idx].get("text", "")
-    return f"{header_text} [SEP] {row_context} [SEP] {cell_text}"
-
-
-# ---------------------------------------------------------------------------
-# Main graph builder
-# ---------------------------------------------------------------------------
 
 def build_question_graph(
     question: Dict,
@@ -110,7 +60,8 @@ def build_question_graph(
         texts:      id -> text record (from load_mmqa_texts).
         tables:     id -> table record (from load_mmqa_tables).
         images:     id -> image record (from load_mmqa_images).
-        max_cells_per_table: Cap on cells per table to avoid memory issues.
+        max_cells_per_table: Cap on non-positive cell nodes per table to avoid memory issues.
+            Gold positive cells from MMQA annotations are always preserved, even beyond this cap.
         candidate_mode: 'oracle' uses gold supporting_context, 'retrieval_lite' uses metadata.
 
     Returns:
@@ -140,14 +91,22 @@ def build_question_graph(
     edges: Dict[str, List[Tuple[str, str]]] = {
         "query_to_text": [],
         "query_to_table": [],
-        "query_to_cell": [],
         "query_to_image": [],
-        "table_contains_cell": [],
+        "query_to_cell": [],
+        "text_to_query": [],
+        "table_to_query": [],
+        "image_to_query": [],
+        "cell_to_query": [],
         "text_refers_table": [],
+        "table_refers_text": [],
         "text_refers_image": [],
+        "image_refers_text": [],
+        "image_has_caption": [],
+        "caption_to_image": [],
+        "table_contains_cell": [],
+        "cell_in_table": [],
         "cell_to_cell_row": [],
         "cell_to_cell_col": [],
-        "image_has_caption": [],
     }
 
     # --- Query node ---
@@ -177,64 +136,79 @@ def build_question_graph(
         })
         text_node_ids.append(node_id)
         edges["query_to_text"].append((q_node_id, node_id))
+        edges["text_to_query"].append((node_id, q_node_id))
 
-    # --- Table + Cell nodes ---
+    # --- Table node (as image) + Cell nodes ---
     table_node_id = None
-    positive_cell_indices = _get_positive_cell_indices(question)
-    cell_node_ids_by_row: Dict[int, List[str]] = {}  # row_idx -> [cell_ids]
-    cell_node_ids_by_col: Dict[int, List[str]] = {}  # col_idx -> [cell_ids]
-    all_cell_node_ids: List[str] = []
-
     if table_id is not None:
         if table_id not in tables:
             logger.warning(f"[{qid}] table_id {table_id} not found, skipping table")
         else:
             rec = tables[table_id]
             table_node_id = _table_id(table_id)
+            table_data = rec.get("table", {})
             nodes["table"].append({
                 "node_id": table_node_id,
-                "text": _flatten_table_text(rec),
                 "table_id": table_id,
+                "title": rec.get("title", ""),
+                "table_data": table_data,
             })
             edges["query_to_table"].append((q_node_id, table_node_id))
+            edges["table_to_query"].append((table_node_id, q_node_id))
 
-            # Create cell nodes with context (header + row context + cell text)
-            rows = _get_table_rows(rec)
-            cell_count = 0
-            for row_idx, row in enumerate(rows):
+            table_rows = table_data.get("table_rows", []) if isinstance(table_data, dict) else []
+            max_cells = max_cells_per_table if max_cells_per_table and max_cells_per_table > 0 else None
+            positive_cells = _get_positive_cell_indices(question)
+            cell_node_ids: List[List[Optional[str]]] = []
+            negative_cell_budget = 0
+
+            for row_idx, row in enumerate(table_rows):
+                row_cell_ids: List[Optional[str]] = []
                 for col_idx, cell in enumerate(row):
-                    should_keep = cell_count < max_cells_per_table or (row_idx, col_idx) in positive_cell_indices
-                    if not should_keep:
+                    is_positive_cell = (row_idx, col_idx) in positive_cells
+                    if max_cells is not None and not is_positive_cell and negative_cell_budget >= max_cells:
+                        row_cell_ids.append(None)
                         continue
-                    cell_text = _cell_text_with_context(rec, row_idx, col_idx)
-                    c_node_id = _cell_id(table_id, row_idx, col_idx)
+                    cell_text = cell.get("text", "") if isinstance(cell, dict) else str(cell)
+                    cell_node_id = _cell_id(table_id, row_idx, col_idx)
                     nodes["cell"].append({
-                        "node_id": c_node_id,
-                        "text": cell_text,
+                        "node_id": cell_node_id,
                         "table_id": table_id,
                         "row": row_idx,
                         "col": col_idx,
+                        "text": cell_text,
+                        "is_positive_candidate": is_positive_cell,
                     })
-                    all_cell_node_ids.append(c_node_id)
-                    edges["query_to_cell"].append((q_node_id, c_node_id))
-                    edges["table_contains_cell"].append((table_node_id, c_node_id))
+                    row_cell_ids.append(cell_node_id)
+                    edges["table_contains_cell"].append((table_node_id, cell_node_id))
+                    edges["cell_in_table"].append((cell_node_id, table_node_id))
+                    edges["query_to_cell"].append((q_node_id, cell_node_id))
+                    edges["cell_to_query"].append((cell_node_id, q_node_id))
+                    if not is_positive_cell:
+                        negative_cell_budget += 1
+                if any(cell_id is not None for cell_id in row_cell_ids):
+                    cell_node_ids.append(row_cell_ids)
 
-                    cell_node_ids_by_row.setdefault(row_idx, []).append(c_node_id)
-                    cell_node_ids_by_col.setdefault(col_idx, []).append(c_node_id)
-                    if cell_count < max_cells_per_table:
-                        cell_count += 1
+            for row_cell_ids in cell_node_ids:
+                for left_idx in range(len(row_cell_ids) - 1):
+                    src = row_cell_ids[left_idx]
+                    dst = row_cell_ids[left_idx + 1]
+                    if src and dst:
+                        edges["cell_to_cell_row"].append((src, dst))
+                        edges["cell_to_cell_row"].append((dst, src))
 
-            # Connect adjacent cells in same row (bidirectional)
-            for row_cells in cell_node_ids_by_row.values():
-                for i in range(len(row_cells) - 1):
-                    edges["cell_to_cell_row"].append((row_cells[i], row_cells[i + 1]))
-                    edges["cell_to_cell_row"].append((row_cells[i + 1], row_cells[i]))
-
-            # Connect adjacent cells in same column (bidirectional)
-            for col_cells in cell_node_ids_by_col.values():
-                for i in range(len(col_cells) - 1):
-                    edges["cell_to_cell_col"].append((col_cells[i], col_cells[i + 1]))
-                    edges["cell_to_cell_col"].append((col_cells[i + 1], col_cells[i]))
+            max_cols = max((len(row) for row in cell_node_ids), default=0)
+            for col_idx in range(max_cols):
+                prev_cell_id = None
+                for row_cell_ids in cell_node_ids:
+                    if col_idx >= len(row_cell_ids):
+                        prev_cell_id = None
+                        continue
+                    cell_id = row_cell_ids[col_idx]
+                    if prev_cell_id and cell_id:
+                        edges["cell_to_cell_col"].append((prev_cell_id, cell_id))
+                        edges["cell_to_cell_col"].append((cell_id, prev_cell_id))
+                    prev_cell_id = cell_id
 
     # --- Image + Caption nodes ---
     image_node_ids = []
@@ -261,18 +235,21 @@ def build_question_graph(
 
         image_node_ids.append(img_node_id)
         edges["query_to_image"].append((q_node_id, img_node_id))
+        edges["image_to_query"].append((img_node_id, q_node_id))
         edges["image_has_caption"].append((img_node_id, cap_node_id))
+        edges["caption_to_image"].append((cap_node_id, img_node_id))
 
-    # Conservative first-pass heuristic: if text/table or text/image coexist in the same
-    # question graph, connect them.
+    # Cross-modal edges: connect text/table and text/image bidirectionally
     if table_node_id is not None:
         for text_node_id in text_node_ids:
             edges["text_refers_table"].append((text_node_id, table_node_id))
+            edges["table_refers_text"].append((table_node_id, text_node_id))
 
     if image_node_ids:
         for text_node_id in text_node_ids:
             for image_node_id in image_node_ids:
                 edges["text_refers_image"].append((text_node_id, image_node_id))
+                edges["image_refers_text"].append((image_node_id, text_node_id))
 
     stats = {
         "n_text": len(nodes["textblock"]),

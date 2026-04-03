@@ -88,7 +88,12 @@ def compute_cosine_similarity(query_emb: torch.Tensor, candidate_embs: torch.Ten
 
 
 @torch.no_grad()
-def evaluate_embedding_only(dataset: List, device: str = "cuda"):
+def evaluate_embedding_only(
+    dataset: List,
+    device: str = "cuda",
+    thresholds: Dict[str, float] = None,
+    freeze_thresholds: bool = False,
+):
     """
     仅使用embedding进行检索评估
 
@@ -99,6 +104,8 @@ def evaluate_embedding_only(dataset: List, device: str = "cuda"):
     4. 按分数排序并评估
     """
     metrics = EvidenceMetrics()
+    if thresholds is not None:
+        metrics.set_thresholds(thresholds, freeze=freeze_thresholds)
     metrics.reset()
 
     device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -144,6 +151,7 @@ def evaluate_embedding_only(dataset: List, device: str = "cuda"):
 
     # 4. 计算最终指标
     result = metrics.compute()
+    result["thresholds"] = metrics.get_thresholds()
 
     return result
 
@@ -174,6 +182,18 @@ def main():
         default="outputs/predictions/embedding_only_metrics.json",
         help="Output file for metrics"
     )
+    parser.add_argument(
+        "--threshold_hetero_dir",
+        type=str,
+        default=None,
+        help="Optional HeteroData directory for the threshold-optimization split"
+    )
+    parser.add_argument(
+        "--optimize_thresholds_on",
+        type=str,
+        default=None,
+        help="Optional split used to optimize thresholds before evaluating the target split; required unless thresholds are supplied from a separate validation run"
+    )
 
     args = parser.parse_args()
 
@@ -186,7 +206,31 @@ def main():
 
     # Evaluate
     logger.info("Evaluating embedding-only retrieval...")
-    metrics = evaluate_embedding_only(dataset, device=args.device)
+    thresholds = None
+    if args.optimize_thresholds_on:
+        if args.optimize_thresholds_on == args.split:
+            raise ValueError("--optimize_thresholds_on must be different from --split to avoid threshold leakage.")
+        threshold_dir = args.threshold_hetero_dir or build_default_hetero_dir(args.optimize_thresholds_on)
+        logger.info(f"Loading threshold split {args.optimize_thresholds_on} from {threshold_dir}")
+        threshold_dataset = load_hetero_data(threshold_dir, args.optimize_thresholds_on)
+        threshold_metrics = evaluate_embedding_only(threshold_dataset, device=args.device)
+        thresholds = threshold_metrics.get("thresholds", {})
+        logger.info(
+            "Learned thresholds from %s: %s",
+            args.optimize_thresholds_on,
+            ", ".join(f"{k}={v:.2f}" for k, v in thresholds.items()),
+        )
+    else:
+        raise ValueError(
+            "Pass --optimize_thresholds_on <validation-split> (and optionally --threshold_hetero_dir) "
+            "to learn thresholds on a separate split before held-out evaluation."
+        )
+    metrics = evaluate_embedding_only(
+        dataset,
+        device=args.device,
+        thresholds=thresholds,
+        freeze_thresholds=True,
+    )
 
     # Print results
     logger.info("\n" + "="*50)

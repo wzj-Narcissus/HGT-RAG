@@ -26,6 +26,11 @@ def main():
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--split", default="dev")
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument(
+        "--optimize-thresholds-on",
+        default=None,
+        help="Optional split (e.g. dev) used to optimize thresholds before evaluating the target split; if omitted, checkpointed validation thresholds are required",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -76,6 +81,7 @@ def main():
         lambda_cell=train_cfg.get("lambda_cell", 1.0),
         lambda_image=train_cfg.get("lambda_image", 1.0),
         lambda_caption=train_cfg.get("lambda_caption", 0.5),
+        lambda_table=train_cfg.get("lambda_table", 0.5),
         lambda_rank=train_cfg.get("lambda_rank", 0.5),
         margin=train_cfg.get("margin", 1.0),
         focal_gamma=train_cfg.get("focal_gamma", 2.0),
@@ -92,7 +98,39 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
     trainer.load_checkpoint(ckpt_path, load_optimizer=False)
 
-    metrics = trainer.evaluate(dataset)
+    eval_thresholds = None
+    if args.optimize_thresholds_on:
+        if args.optimize_thresholds_on == args.split:
+            raise ValueError("--optimize-thresholds-on must be different from --split to avoid threshold leakage.")
+        threshold_dataset = load_hetero_dataset(
+            graphs_dir, args.optimize_thresholds_on, encoder, image_dir, cfg,
+            cache_dir=output_cfg.get("features_dir", "outputs/features"),
+            chunk_size=train_cfg.get("chunk_size"),
+        )
+        threshold_metrics = trainer.evaluate(threshold_dataset)
+        eval_thresholds = threshold_metrics.get("thresholds", {})
+        logger.info(
+            "Learned thresholds from %s: %s",
+            args.optimize_thresholds_on,
+            ", ".join(f"{k}={v:.2f}" for k, v in eval_thresholds.items()),
+        )
+    elif trainer._best_thresholds:
+        eval_thresholds = dict(trainer._best_thresholds)
+        logger.info(
+            "Using checkpointed validation thresholds: %s",
+            ", ".join(f"{k}={v:.2f}" for k, v in eval_thresholds.items()),
+        )
+    else:
+        raise ValueError(
+            "No reusable thresholds found in the checkpoint. "
+            "Pass --optimize-thresholds-on <validation-split> to learn thresholds on a separate split."
+        )
+
+    metrics = trainer.evaluate(
+        dataset,
+        thresholds=eval_thresholds,
+        freeze_thresholds=True,
+    )
 
     out_path = os.path.join(output_cfg["predictions_dir"], f"metrics_{args.split}.json")
     os.makedirs(output_cfg["predictions_dir"], exist_ok=True)
@@ -101,7 +139,10 @@ def main():
 
     print("\n=== Evaluation Results ===")
     for k, v in sorted(metrics.items()):
-        print(f"  {k}: {v:.4f}")
+        if isinstance(v, (int, float)):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":
